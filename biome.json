@@ -2,7 +2,7 @@
     "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
     "files": {
         "ignoreUnknown": true,
-        "includes": ["**", "!node_modules"]
+        "includes": ["**", "!node_modules", "!**/.wrangler"]
     },
     "formatter": {
         "enabled": true,
@@ -17,6 +17,18 @@
             "preset": "recommended"
         }
     },
+    "overrides": [
+        {
+            "includes": ["scripts/**"],
+            "linter": {
+                "rules": {
+                    "complexity": {
+                        "noUselessLoneBlockStatements": "off"
+                    }
+                }
+            }
+        }
+    ],
     "assist": {
         "actions": {
             "source": {
