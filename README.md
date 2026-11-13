@@ -73,6 +73,16 @@ node scripts/audit-upstream.mjs       # 本地测试上游 :8901
 pnpm wrangler dev --config workers/reverse-proxy/wrangler.jsonc --port 8788
 node scripts/audit-reverse-e2e.mjs    # reverse-proxy E2E（77 项）
 
+# 被墙上游（Docker Hub、github.com）的全链验证：workerd 本身不吃代理，
+# runner 把 worker 的出站 fetch 劫持到 Node 进程走 HTTPS_PROXY：
+NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://10.192.7.1:7890 \
+  node scripts/dev-via-proxy.mjs workers/container-proxy 8786 &
+node scripts/audit-dockerhub-e2e.mjs  # 真实 Docker Hub 全链（17 项；认证段用
+                                      # DOCKER_ID/DOCKER_PAT env，凭据不落盘）
+
+node scripts/audit-ghmirror-unit.mjs  # gh-mirror 单元审计（25 项；worker 源在
+                                      # ../blog/workers/gh-mirror/，argv 可覆写）
+
 pnpm wrangler dev --config workers/container-proxy/wrangler.jsonc --port 8787
 node scripts/audit-container-e2e.mjs  # container-proxy 真实 registry E2E（19 项）
 ```

@@ -19,15 +19,20 @@ pnpm run ci                     # biome check + tsc --noEmit（每轮开头先�
 node scripts/audit-upstream.mjs # 本地测试上游 :8901（协议矩阵的确定性靶机）
 pnpm wrangler dev --config workers/reverse-proxy/wrangler.jsonc   --port 8788  # 通用反代
 pnpm wrangler dev --config workers/container-proxy/wrangler.jsonc --port 8787  # 容器代理
+# 被墙上游（Docker Hub、github.com）的全链验证走代理 runner（见 §10 runner 条目）：
+NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://10.192.7.1:7890 \
+  node scripts/dev-via-proxy.mjs workers/container-proxy 8786
 ```
 
 审计脚本（`node scripts/audit-*.mjs`，均零依赖、exit 1 = 有失败）：
 
-| 脚本                       | 前置                                 | 覆盖                                                                                                                              |
-| -------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `audit-container-unit.mjs` | 无（mock fetch + 内存 cache）        | Docker Hub / elastic 全协议路径（被墙网络的兜底）：202 Location、realm 路由、token/manifest/blob 缓存、HEAD 重放、cf-\*/AE 头过滤 |
-| `audit-container-e2e.mjs`  | container wrangler dev :8787         | 真实 quay/ghcr/k8s/nvcr/mcr：challenge→token→manifest→blob 全舞步 + digest 缓存                                                   |
-| `audit-reverse-e2e.mjs`    | reverse wrangler dev :8788 + harness | §5 全矩阵（头过滤/改写/GBK/压缩/重定向/cookie/Range/304/缓存门控/预检/userinfo/referer 回落/SSE）                                 |
+| 脚本                       | 前置                                             | 覆盖                                                                                                                                                                   |
+| -------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit-container-unit.mjs` | 无（mock fetch + 内存 cache）                    | Docker Hub / elastic 全协议路径（被墙网络的兜底）：202 Location、realm 路由、token/manifest/blob 缓存、HEAD 重放、cf-\*/AE 头过滤                                      |
+| `audit-container-e2e.mjs`  | container wrangler dev :8787                     | 真实 quay/ghcr/k8s/nvcr/mcr：challenge→token→manifest→blob 全舞步 + digest 缓存                                                                                        |
+| `audit-dockerhub-e2e.mjs`  | dev-via-proxy runner :8786（代理出口）           | **真实 Docker Hub 全链**：realm 改写→匿名 token→tag/digest manifest→blob 307 跟随→HEAD；认证段（`DOCKER_ID`/`DOCKER_PAT` env，不落盘）验证 Basic 换 JWT + 账号限流归因 |
+| `audit-ghmirror-unit.mjs`  | 无（mock fetch；默认导入 blog 仓库的 worker 源） | gh-mirror（源在 `../blog/workers/gh-mirror/`，argv 可覆写）：路径解析、认证注入、Range/HEAD、状态透传、git owner 修复、push 拒绝、预检                                 |
+| `audit-reverse-e2e.mjs`    | reverse wrangler dev :8788 + harness             | §5 全矩阵（头过滤/改写/GBK/压缩/重定向/cookie/Range/304/缓存门控/预检/userinfo/referer 回落/SSE）                                                                      |
 
 - 国际网络（GitHub、境外 registry、wrangler 下载）：`HTTP_PROXY=http://10.192.7.1:7890
   HTTPS_PROXY=http://10.192.7.1:7890 NO_PROXY=localhost,127.0.0.1`。
@@ -194,6 +199,21 @@ E2E：`audit-reverse-e2e.mjs`（77 项）+ 浏览器 shim 断言页（16 项）+
 - workerd 出口会按客户端 AE 重新压缩响应（CE 头出现属正常，别当乱码 bug）。
 - `curl -H "Host: …"` 测子域路由可行；node fetch 禁改 Host，用 `node:http`。
 - E2E 一次热载内跑多轮会让 CDN 层缓存旧断言——跑缓存相关断言只信全新实例。
+- **workerd 完全不吃代理**：二进制里没有任何 proxy/socks 支持，`HTTPS_PROXY`/
+  `ALL_PROXY` 环境变量对 worker 的出站 fetch 无效（被墙上游的本地全链验证只能靠
+  runner）。`scripts/dev-via-proxy.mjs` 用 miniflare `outboundService` 把出站
+  fetch 劫持回 Node 进程——Node 24 原生 fetch 在 `NODE_USE_ENV_PROXY=1` 下才认
+  代理 env； runner 里自建 `node:http` 服务器 + `dispatchFetch`（不依赖
+  miniflare listener，且天然保留 Host 头路由），按 `export default` 自动判
+  module/service-worker 格式，`script` 内容直传绕开 workerd 沙箱「路径不得离开
+  起始目录」限制。**miniflare 必须钉 4.x**：5-beta 构造器 API 全变（`workers`
+  数组），且其内置 workerd 版本必须与兼容日匹配（4.20260730 支持到
+  2026-08-06，runner 里 harness 专用降级，被审 worker 只用远古稳定 API）。
+- miniflare/dispatchFetch 转发响应时 `appendHeader` 必须在 `writeHead` 之前
+  （Node 语义），否则带 Set-Cookie 的响应 500——token 端点最先踩中。
+- 审计目标可以跨仓库：gh-mirror 的源在 blog 仓库（部署归属地），本仓库的
+  audit-ghmirror-unit.mjs 直接导入其 worker 文件（argv 可覆写路径），runner
+  接受任意 worker 目录。worker 的修复改在归属仓库，审计工具留在本仓库。
 
 ## 11. 收尾闭环
 
@@ -226,3 +246,12 @@ Referrer-Policy 剥离防 referer 回落失效；git/WebSocket/GBK/Range/304 路
 配套：wrangler.jsonc `issue_detection` 无效字段名 → `issues.enabled`；新增
 audit-upstream/audit-container-unit/audit-container-e2e/audit-reverse-e2e 四个
 审计脚本与浏览器 shim 断言页；biome 排除与 scripts 规则豁免。
+
+二轮增补（runner 通链后）：`audit-dockerhub-e2e.mjs`（真实 Docker Hub 全链
+17 项，匿名 + 认证段）与 `dev-via-proxy.mjs` 代理 runner 打通被墙上游的本地
+全链验证；gh-mirror（源在 blog 仓库，v1.1）——git clone 生产坏（owner 被剥/
+未补全，两种 URL 形式都 404）→ `resolveGitPath` 恒补 owner，已知扩展丢上游
+Cache-Control/ETag → 统一透传上游头，非 200 一律压成 404（限流/鉴权错误被掩
+盖）→ 仅 404 掩盖其余透传，Range/HEAD 不透传 → 透传，预检打上游 → 本地 204，
+jsonc `issue_detection` 字段同步修正；新增 `audit-ghmirror-unit.mjs`（25 项，
+mock GitHub raw/git 协议形状）。
