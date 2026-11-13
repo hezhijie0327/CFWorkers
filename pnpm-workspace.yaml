@@ -1,1 +1,14 @@
 minimumReleaseAge: 0
+# Tooling-only transitive bumps: miniflare 4 (the audit runner) pulls undici
+# 7.28 / sharp 0.35.2, both with open advisories; 7.30.1 / 0.35.5 are the
+# exact versions wrangler's own bundled miniflare 5 already ships, so the
+# audited runtime surface stays identical.
+overrides:
+    undici: 7.30.1
+    sharp: 0.35.5
+# esbuild/workerd postinstalls are binary validators only - the platform
+# binaries ship as optionalDependencies and wrangler/miniflare resolve them
+# directly (the whole audit suite runs with these builds denied).
+allowBuilds:
+    esbuild: false
+    workerd: false
