@@ -116,6 +116,11 @@ const server = createServer(async (req, res) => {
 server.on("clientError", (_err, socket) => socket.end("HTTP/1.1 400 Bad Request\r\n\r\n"));
 
 await mf.ready;
+server.on("error", (error) => {
+    console.error(`runner failed to listen on :${port} - ${error.message}`);
+    process.exit(2);
+});
+
 server.listen(port, "127.0.0.1", () => {
     const egress = process.env.NODE_USE_ENV_PROXY
         ? `proxied via ${process.env.HTTPS_PROXY || process.env.HTTP_PROXY}`

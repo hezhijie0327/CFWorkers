@@ -211,9 +211,20 @@ E2E：`audit-reverse-e2e.mjs`（77 项）+ 浏览器 shim 断言页（16 项）+
   2026-08-06，runner 里 harness 专用降级，被审 worker 只用远古稳定 API）。
 - miniflare/dispatchFetch 转发响应时 `appendHeader` 必须在 `writeHead` 之前
   （Node 语义），否则带 Set-Cookie 的响应 500——token 端点最先踩中。
+- **`NODE_USE_ENV_PROXY=1` 在启动时快照**，事后 `delete process.env` 无效：
+  它会让**本进程所有 `node:http` 请求**也走代理重写（`rewriteForProxiedHttp`），
+  重写校验 Host 头必须匹配 authority——虚拟路由 Host（如 mirror.test）+
+  127.0.0.1 authority 的探针必炸。要同时「测 localhost + 让 runner 代理出口」
+  时，测试进程必须 proxy-free：re-exec 干净 env 重启自身，代理 env 只注入
+  runner 子进程（blog 仓库 scripts/audit-ghmirror-e2e.mjs 即此模式）。
+- runner 的 `server.listen` 失败（端口占用等）必须显式 `server.on("error")`
+  退出，否则 unhandled error 直接崩且无诊断。
 - 审计目标可以跨仓库：gh-mirror 的源在 blog 仓库（部署归属地），本仓库的
   audit-ghmirror-unit.mjs 直接导入其 worker 文件（argv 可覆写路径），runner
-  接受任意 worker 目录。worker 的修复改在归属仓库，审计工具留在本仓库。
+  接受任意 worker 目录；其全链 E2E（真实 GitHub，14 项）落在 blog 仓库的
+  `scripts/audit-ghmirror-e2e.mjs`（零参数自管代理，runner 默认取兄弟目录
+  CFWorkers 检出，`CFW_RUNNER`/`CFW_PROXY` 可覆写）。worker 的修复改在归属
+  仓库，审计工具按「协议断言归审计仓库、worker 专属 E2E 归 worker 仓库」分置。
 
 ## 11. 收尾闭环
 
