@@ -1,6 +1,8 @@
 // Description: Using Cloudflare Workers to Reverse Proxy everything.
-// Version: 2.1 - HTMLRewriter based URL rewriting, SPA client shim injection,
-//          cookie translation, WebSocket relay, git passthrough.
+// Version: 2.2 - upstream Accept-Encoding no longer forwarded (fixes brotli
+//          corruption), edge caching for static assets, upstream Cache-Control
+//          passthrough, CORS preflight answers, WebSocket error propagation,
+//          wider SPA shim (EventSource/sendBeacon/Worker/form.submit/location).
 //
 // Usage:
 //   https://worker/https://example.com/page
@@ -11,12 +13,17 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-// Hop-by-hop and worker-owned request headers that must not reach the upstream.
+// Hop-by-hop, worker-owned, and compression-negotiating request headers that
+// must not reach the upstream. accept-encoding stays out so the runtime
+// negotiates gzip itself and transparently decompresses - forwarding the
+// client's brotli preference would return a compressed body that the dropped
+// Content-Encoding header then turns into garbage at the browser.
 const REQUEST_SKIP_HEADERS = new Set([
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -25,9 +32,12 @@ const REQUEST_SKIP_HEADERS = new Set([
     "cookie",
     "host",
     "content-length",
+    "accept-encoding",
 ]);
 
-// Security and encoding headers that would break or re-compress the rewritten response.
+// Security and encoding headers that would break or re-compress the rewritten
+// response. Referrer-Policy must go too: a `no-referrer` policy would starve
+// the referer-based fallback that keeps unpatched relative requests proxied.
 const RESPONSE_DROP_HEADERS = [
     "Content-Encoding",
     "Content-Length",
@@ -37,23 +47,49 @@ const RESPONSE_DROP_HEADERS = [
     "Cross-Origin-Opener-Policy",
     "Cross-Origin-Embedder-Policy",
     "Cross-Origin-Resource-Policy",
+    "Referrer-Policy",
 ];
 
-const RESPONSE_SET_HEADERS = {
+const CORS_HEADERS = {
     "Access-Control-Allow-Headers": "*",
     "Access-Control-Allow-Methods": "*",
     "Access-Control-Allow-Origin": "*",
-    "Cache-Control": "no-store",
 };
 
 // Git smart-HTTP endpoints are passed through byte-for-byte, never rewritten.
 const GIT_PATH_PATTERN = /\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
 // URL-bearing attributes rewritten on every proxied HTML element.
-const REWRITE_ATTRS = ["href", "src", "srcset", "action", "data", "poster", "style"];
+const REWRITE_ATTRS = ["href", "src", "srcset", "action", "formaction", "data", "poster", "style"];
 
-const REWRITE_ELEMENTS =
-    "a, area, base, form, img, script, iframe, audio, video, source, embed, track, input, object, link";
+// Universal selector: url-bearing attributes (style! formaction!) appear on
+// arbitrary elements, not just the classic URL-carrying set.
+const REWRITE_ELEMENTS = "*";
+
+// Content types eligible for edge caching: immutable-ish static payloads whose
+// URL fully identifies the content. Rewritten HTML/CSS handling lives in
+// serveHtml/serveCss; APIs and HTML are never edge-cached.
+const CACHEABLE_TYPES = [
+    "image/",
+    "font/",
+    "video/",
+    "audio/",
+    "text/css",
+    "application/javascript",
+    "text/javascript",
+    "application/x-javascript",
+    "application/wasm",
+    "application/octet-stream",
+    "application/pdf",
+    "model/",
+];
+
+// Requests that must bypass the shared edge cache: byte ranges, conditional
+// revalidation, and anything personalized (auth, cookies).
+const REQUEST_CACHE_BYPASS_HEADERS = ["range", "if-none-match", "if-modified-since", "authorization", "cookie"];
+
+// When upstream allows caching only via "public" without max-age.
+const DEFAULT_PUBLIC_TTL_SECONDS = 600;
 
 // ---------------------------------------------------------------------------
 // Entry point and request pipeline
@@ -68,6 +104,10 @@ async function fetchHandler(e) {
         const req = e.request;
         const urlObj = new URL(req.url);
 
+        if (req.method === "OPTIONS" && req.headers.has("access-control-request-method")) {
+            return corsPreflight();
+        }
+
         if (urlObj.pathname === "/" && !urlObj.search) {
             return usagePage(urlObj.origin);
         }
@@ -81,34 +121,58 @@ async function fetchHandler(e) {
             return await proxyWebSocket(req, targetUrl);
         }
 
-        return await proxyHttp(req, targetUrl, urlObj);
+        return await proxyHttp(req, targetUrl, urlObj, e);
     } catch (error) {
+        console.error("reverse-proxy error:", error);
         return jsonError(error instanceof Error ? error.message : String(error), 500);
     }
 }
 
-/** @param {Request} req @param {string} targetUrl @param {URL} urlObj */
-async function proxyHttp(req, targetUrl, urlObj) {
+/** @param {Request} req @param {string} targetUrl @param {URL} urlObj @param {any} event */
+async function proxyHttp(req, targetUrl, urlObj, event) {
     const git = isGitTarget(targetUrl, req);
+    const cacheKey = !git && cacheCandidate(req) ? new Request(req.url) : null;
+    if (cacheKey) {
+        const hit = await caches.default.match(cacheKey);
+        if (hit) {
+            return cachedResponse(hit);
+        }
+    }
+
+    // URL userinfo (https://user:pass@host/) becomes a Basic Authorization
+    // header; fetch() rejects URLs that still carry credentials.
+    const target = new URL(targetUrl);
+    let urlAuthorization = null;
+    if (target.username) {
+        urlAuthorization = `Basic ${btoa(`${decodeURIComponent(target.username)}:${decodeURIComponent(target.password)}`)}`;
+        target.username = "";
+        target.password = "";
+        targetUrl = target.href;
+    }
+
+    // GET/HEAD requests must not carry a body or fetch() throws.
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
     const res = await fetch(targetUrl, {
-        body: req.body,
-        headers: filterRequestHeaders(req, targetUrl, urlObj),
+        body: hasBody ? req.body : undefined,
+        headers: filterRequestHeaders(req, targetUrl, urlObj, urlAuthorization),
         method: req.method,
         redirect: "manual",
     });
 
-    const headers = buildResponseHeaders(res, targetUrl, urlObj, { git });
+    const contentType = (res.headers.get("Content-Type") || "").toLowerCase();
     // 204/304 have no body to re-wrap; git payloads must stay byte-for-byte.
-    if (!res.body || res.status === 204 || res.status === 304 || git) {
-        return streamResponse(res, headers);
+    if (res.body && res.status !== 204 && res.status !== 304 && !git) {
+        if (contentType.includes("text/html")) {
+            return serveHtml(res, targetUrl, urlObj);
+        }
+        if (contentType.includes("text/css")) {
+            return serveCss(res, targetUrl, urlObj, cacheKey);
+        }
     }
 
-    const contentType = (res.headers.get("Content-Type") || "").toLowerCase();
-    if (contentType.includes("text/html")) {
-        return serveHtml(res, targetUrl, urlObj);
-    }
-    if (contentType.includes("text/css")) {
-        return serveCss(res, targetUrl, urlObj);
+    const headers = buildResponseHeaders(res, targetUrl, urlObj, { git });
+    if (cacheKey && !git && streamCacheEligible(res, contentType)) {
+        return await cacheAndStream(res, headers, cacheKey, event);
     }
     return streamResponse(res, headers);
 }
@@ -170,8 +234,8 @@ function isGitTarget(targetUrl, req) {
 // Request header handling
 // ---------------------------------------------------------------------------
 
-/** @param {Request} req @param {string} targetUrl @param {URL} urlObj */
-function filterRequestHeaders(req, targetUrl, urlObj) {
+/** @param {Request} req @param {string} targetUrl @param {URL} urlObj @param {string | null} urlAuthorization */
+function filterRequestHeaders(req, targetUrl, urlObj, urlAuthorization) {
     const out = new Headers();
     req.headers.forEach((value, key) => {
         const lowerKey = key.toLowerCase();
@@ -185,6 +249,10 @@ function filterRequestHeaders(req, targetUrl, urlObj) {
     const cookie = translateRequestCookie(req.headers.get("cookie"), hostTag(new URL(targetUrl).host));
     if (cookie) {
         out.set("cookie", cookie);
+    }
+    // Credentials embedded in the proxied URL override the client's header.
+    if (urlAuthorization) {
+        out.set("authorization", urlAuthorization);
     }
     return out;
 }
@@ -238,7 +306,7 @@ function buildResponseHeaders(res, targetUrl, urlObj, opts) {
         out.delete(name);
     });
     if (!opts.git) {
-        Object.entries(RESPONSE_SET_HEADERS).forEach(([key, value]) => {
+        Object.entries(CORS_HEADERS).forEach(([key, value]) => {
             out.set(key, value);
         });
     }
@@ -283,14 +351,19 @@ function rewriteSetCookieHeaders(headers, targetUrl) {
 
 // Scope every upstream cookie to the worker origin: drop Domain, pin Path=/,
 // prefix the name with a per-target-host tag so sites cannot collide.
+// __Host-/__Secure- prefixes lose their semantics once renamed (strip them),
+// and SameSite=None without Secure is rejected by browsers, so force Secure.
 /** @param {string} cookie @param {string} tag */
 function rewriteSetCookie(cookie, tag) {
     const parts = cookie.split(";");
     const eq = parts[0].indexOf("=");
     if (eq > 0) {
-        const name = parts[0].slice(0, eq).trim();
+        const name = parts[0]
+            .slice(0, eq)
+            .trim()
+            .replace(/^__(?:Host|Secure)-/i, "");
         if (name && !name.startsWith(tag)) {
-            parts[0] = ` ${tag}${name}=${parts[0].slice(eq + 1).trim()}`;
+            parts[0] = `${tag}${name}=${parts[0].slice(eq + 1).trim()}`;
         }
     }
     const kept = parts.slice(1).filter((attr) => {
@@ -298,7 +371,11 @@ function rewriteSetCookie(cookie, tag) {
         return attrName !== "domain" && attrName !== "path";
     });
     kept.push(" Path=/");
-    return parts[0] + kept.join(";");
+    const attrs = kept.map((attr) => attr.trim().toLowerCase());
+    if (attrs.some((attr) => attr.startsWith("samesite=none")) && !attrs.includes("secure")) {
+        kept.push(" Secure");
+    }
+    return [parts[0], ...kept].join(";");
 }
 
 /** @param {string} host */
@@ -308,6 +385,106 @@ function hostTag(host) {
         hash = ((hash << 5) + hash + host.charCodeAt(i)) >>> 0;
     }
     return `p${hash.toString(36)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Edge caching
+// ---------------------------------------------------------------------------
+
+/** @param {Request} req */
+function cacheCandidate(req) {
+    if (req.method !== "GET") {
+        return false;
+    }
+    return !REQUEST_CACHE_BYPASS_HEADERS.some((name) => req.headers.has(name));
+}
+
+/** @param {Response} res @param {string} contentType */
+function streamCacheEligible(res, contentType) {
+    return (
+        res.status === 200 &&
+        res.body !== null &&
+        !res.headers.has("Set-Cookie") &&
+        varyAllowsCaching(res.headers.get("Vary")) &&
+        CACHEABLE_TYPES.some((prefix) => contentType.startsWith(prefix)) &&
+        upstreamCacheTtl(res.headers.get("Cache-Control")) > 0
+    );
+}
+
+// Vary must be absent or limited to content we already normalized away.
+/** @param {string | null} vary */
+function varyAllowsCaching(vary) {
+    if (!vary) {
+        return true;
+    }
+    return vary.split(",").every((name) => name.trim().toLowerCase() === "accept-encoding" || name.trim() === "*");
+}
+
+// Only cache when the upstream explicitly allows sharing: no no-store/no-cache/
+// private, and either an explicit max-age or a public directive.
+/** @param {string | null} cacheControl */
+function upstreamCacheTtl(cacheControl) {
+    if (!cacheControl) {
+        return 0;
+    }
+    const directives = cacheControl.split(",").map((directive) => directive.trim().toLowerCase());
+    if (
+        directives.some((directive) => /^no-store|^no-cache|^private/.test(directive)) ||
+        !directives.some((directive) => /^max-age=|^s-maxage=|^public$/.test(directive))
+    ) {
+        return 0;
+    }
+    for (const directive of directives) {
+        const match = /^s-maxage=(\d+)/.exec(directive);
+        if (match) {
+            return Number(match[1]);
+        }
+    }
+    for (const directive of directives) {
+        const match = /^max-age=(\d+)/.exec(directive);
+        if (match) {
+            return Number(match[1]);
+        }
+    }
+    return DEFAULT_PUBLIC_TTL_SECONDS;
+}
+
+/** @param {Response} hit */
+function cachedResponse(hit) {
+    const headers = new Headers(hit.headers);
+    return new Response(hit.body, { status: hit.status, headers });
+}
+
+// Cache-eligible bodies up to this size are fully read and put inline
+// (deterministic write); anything larger streams into the cache via
+// waitUntil instead, keeping big-file TTFB streaming.
+const MAX_BUFFERED_CACHE_BYTES = 8 * 1024 * 1024;
+
+/** @param {Response} res @param {Headers} headers @param {Request} cacheKey @param {any} event */
+async function cacheAndStream(res, headers, cacheKey, event) {
+    const ttl = upstreamCacheTtl(res.headers.get("Cache-Control"));
+    if (!res.body) {
+        return streamResponse(res, headers);
+    }
+    headers.set("Cache-Control", `public, max-age=${ttl}`);
+    const [clientBody, cacheBody] = res.body.tee();
+    const storedHeaders = new Headers(headers);
+    const length = Number(res.headers.get("Content-Length"));
+    if (!Number.isFinite(length) || length <= MAX_BUFFERED_CACHE_BYTES) {
+        // Inline await: local workerd drops waitUntil cache writes once the
+        // handler has issued subrequests; production is unaffected either way.
+        const buf = await new Response(cacheBody).arrayBuffer();
+        await caches.default
+            .put(cacheKey, new Response(buf, { status: 200, headers: storedHeaders }))
+            .catch((error) => console.error("stream cache put failed:", error));
+    } else {
+        event.waitUntil(
+            caches.default
+                .put(cacheKey, new Response(cacheBody, { status: 200, headers: storedHeaders }))
+                .catch((error) => console.error("stream cache put failed:", error)),
+        );
+    }
+    return new Response(clientBody, { status: res.status, headers });
 }
 
 // ---------------------------------------------------------------------------
@@ -495,15 +672,22 @@ class StyleTextRewriter {
     }
 }
 
-class HeadInjector {
-    /** @param {string} scriptHtml */
-    constructor(scriptHtml) {
+// The shim must run before any page script: prepend to <head>, falling back
+// to <body> for documents without one (shared flag prevents double injection).
+class ShimInjector {
+    /** @param {string} scriptHtml @param {{ injected: boolean }} state */
+    constructor(scriptHtml, state) {
         this.scriptHtml = scriptHtml;
+        this.state = state;
     }
 
     /** @param {any} el */
     element(el) {
-        el.append(this.scriptHtml, { html: true });
+        if (this.state.injected) {
+            return;
+        }
+        this.state.injected = true;
+        el.prepend(this.scriptHtml, { html: true });
     }
 }
 
@@ -514,19 +698,23 @@ async function serveHtml(res, targetUrl, urlObj) {
 
     const headers = buildResponseHeaders(res, targetUrl, urlObj, {});
     headers.set("Content-Type", "text/html; charset=utf-8");
+    // Rewritten pages embed the shim and per-worker origins; never cache.
+    headers.set("Cache-Control", "no-store");
 
     const ctx = makeCtx(targetUrl, urlObj);
     const shim = clientShim(hostTag(new URL(targetUrl).host));
+    const injectorState = { injected: false };
     return new HTMLRewriter()
         .on(REWRITE_ELEMENTS, new AttrRewriter(ctx))
         .on("meta", new MetaRefreshRewriter(ctx))
         .on("style", new StyleTextRewriter(ctx))
-        .on("head", new HeadInjector(shim))
+        .on("head", new ShimInjector(shim, injectorState))
+        .on("body", new ShimInjector(shim, injectorState))
         .transform(new Response(html, { status: res.status, statusText: res.statusText, headers }));
 }
 
-/** @param {Response} res @param {string} targetUrl @param {URL} urlObj */
-async function serveCss(res, targetUrl, urlObj) {
+/** @param {Response} res @param {string} targetUrl @param {URL} urlObj @param {Request | null} cacheKey */
+async function serveCss(res, targetUrl, urlObj, cacheKey) {
     const buf = await res.arrayBuffer();
     const css = rewriteCssText(
         decodeBody(buf, detectCharset(res.headers.get("Content-Type"), buf)),
@@ -535,12 +723,37 @@ async function serveCss(res, targetUrl, urlObj) {
 
     const headers = buildResponseHeaders(res, targetUrl, urlObj, {});
     headers.set("Content-Type", "text/css; charset=utf-8");
-    return new Response(css, { status: res.status, statusText: res.statusText, headers });
+    // The rewrite is deterministic per target URL, so the upstream policy can
+    // be honored - but never cache private/non-cacheable payloads.
+    const ttl = upstreamCacheTtl(res.headers.get("Cache-Control"));
+    headers.set("Cache-Control", ttl > 0 ? `public, max-age=${ttl}` : "no-store");
+    if (cacheKey && ttl > 0) {
+        // Inline await: tiny body, and local dev drops waitUntil cache writes
+        // once the handler has issued subrequests.
+        await caches.default
+            .put(cacheKey, new Response(css, { status: 200, headers: new Headers(headers) }))
+            .catch((error) => console.error("css cache put failed:", error));
+    }
+    return new Response(css, { status: res.status, headers });
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket relay
 // ---------------------------------------------------------------------------
+
+/** @param {WebSocket} ws @param {any} event */
+function closeWebSocket(ws, event) {
+    try {
+        // close() throws on oversized/invalid reasons; fall back to a bare close.
+        ws.close(event.code, event.reason);
+    } catch {
+        try {
+            ws.close();
+        } catch {
+            // already closed
+        }
+    }
+}
 
 /** @param {Request} req @param {string} targetUrl */
 async function proxyWebSocket(req, targetUrl) {
@@ -549,6 +762,11 @@ async function proxyWebSocket(req, targetUrl) {
     const protocol = req.headers.get("sec-websocket-protocol");
     if (protocol) {
         headers.set("Sec-WebSocket-Protocol", protocol);
+    }
+    // Cookie-gated WS endpoints need the namespaced cookies translated too.
+    const cookie = translateRequestCookie(req.headers.get("cookie"), hostTag(new URL(targetUrl).host));
+    if (cookie) {
+        headers.set("Cookie", cookie);
     }
 
     const res = await fetch(upstreamUrl, { headers });
@@ -561,6 +779,9 @@ async function proxyWebSocket(req, targetUrl) {
     const pair = new WebSocketPair();
     const server = pair[1];
     server.accept();
+    // RFC 6455: the handshake response must echo the upstream-selected
+    // subprotocol or clients that offered one abort the connection.
+    const selectedProtocol = res.headers.get("sec-websocket-protocol");
 
     server.addEventListener("message", (event) => {
         try {
@@ -577,21 +798,33 @@ async function proxyWebSocket(req, targetUrl) {
         }
     });
     server.addEventListener("close", (event) => {
+        closeWebSocket(upstream, event);
+    });
+    upstream.addEventListener("close", (event) => {
+        closeWebSocket(server, event);
+    });
+    // Errors (abnormal closures) must propagate to the other side or the peer
+    // hangs until its own timeout.
+    server.addEventListener("error", () => {
         try {
-            upstream.close(event.code, event.reason);
+            upstream.close();
         } catch {
             // already closed
         }
     });
-    upstream.addEventListener("close", (event) => {
+    upstream.addEventListener("error", () => {
         try {
-            server.close(event.code, event.reason);
+            server.close();
         } catch {
             // already closed
         }
     });
 
-    return new Response(null, { status: 101, webSocket: pair[0] });
+    return new Response(null, {
+        status: 101,
+        headers: selectedProtocol ? { "Sec-WebSocket-Protocol": selectedProtocol } : undefined,
+        webSocket: pair[0],
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -607,11 +840,18 @@ function streamResponse(res, headers) {
     });
 }
 
+function corsPreflight() {
+    return new Response(null, {
+        status: 204,
+        headers: { ...CORS_HEADERS, "Access-Control-Max-Age": "86400", "Cache-Control": "no-store" },
+    });
+}
+
 /** @param {string} message @param {number} status */
 function jsonError(message, status) {
     return new Response(JSON.stringify({ error: message }), {
         status,
-        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+        headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...CORS_HEADERS },
     });
 }
 
@@ -638,9 +878,11 @@ function usagePage(workerOrigin) {
 // ---------------------------------------------------------------------------
 
 // Injected into every proxied HTML page. Rewrites runtime-generated URLs
-// (fetch/XHR/pushState/WebSocket/setAttribute/src-srcset properties, clicks,
-// form submits), namespaces document.cookie per target host, and blocks the
-// target site's own service workers from taking over the proxy origin.
+// (fetch/XHR/EventSource/sendBeacon/Worker/pushState/location/WebSocket/
+// setAttribute/src-srcset properties, clicks, form submits including direct
+// form.submit() calls), namespaces document.cookie per target host, rewrites
+// runtime-inserted CSS url() rules, and blocks the target site's own service
+// workers from taking over the proxy origin.
 // String.raw keeps the regex backslashes literal inside the template literal.
 /** @param {string} tag */
 function clientShim(tag) {
@@ -651,6 +893,9 @@ function clientShim(tag) {
   var SKIP = /^(?:data|blob|javascript|mailto|tel|about):/i;
 
   function abs(u) {
+    // path-only proxy URLs ("/http://target/...") are already proxied;
+    // resolving them against the target would double the prefix
+    if (/^\/(?:https?|wss):\/\//i.test(u)) return W + u;
     try { return new URL(u, T).href; } catch (e) { return null; }
   }
   function px(u) {
@@ -678,6 +923,11 @@ function clientShim(tag) {
     if (s.charAt(0) === "#" || s.indexOf(W + "/") === 0) return s;
     return px(ABS.test(s) ? s : abs(s));
   }
+  function rwCss(s) {
+    return String(s).replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (m, q, u) {
+      return "url(" + q + px(u) + q + ")";
+    });
+  }
 
   var hp = history.pushState, hr = history.replaceState;
   history.pushState = function (s, t, u) {
@@ -691,9 +941,22 @@ function clientShim(tag) {
   window.fetch = function (input, init) {
     try {
       if (typeof input === "string" || input instanceof URL) input = px(String(input));
+      else if (input && typeof input.url === "string") input = new Request(px(input.url), input);
     } catch (e) {}
     return of.call(this, input, init);
   };
+
+  // Request inputs constructed directly (fetch(new Request(abs)) is covered
+  // above, but Request objects also flow through caches/other APIs).
+  var REQ = window.Request;
+  if (REQ) {
+    var REQW = function (u, i) {
+      try { if (typeof u === "string") u = px(u); } catch (e) {}
+      return i === undefined ? new REQ(u) : new REQ(u, i);
+    };
+    REQW.prototype = REQ.prototype;
+    window.Request = REQW;
+  }
 
   var xo = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
@@ -710,6 +973,38 @@ function clientShim(tag) {
   window.WebSocket.CLOSING = 2;
   window.WebSocket.CLOSED = 3;
 
+  var ES = window.EventSource;
+  if (ES) {
+    var ESW = function (u, c) { return new ES(px(u), c); };
+    ESW.prototype = ES.prototype;
+    ESW.CONNECTING = 0; ESW.OPEN = 1; ESW.CLOSED = 2;
+    window.EventSource = ESW;
+  }
+
+  if (navigator.sendBeacon) {
+    var sb = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (u, d) {
+      try { u = px(u); } catch (e) {}
+      return sb(u, d);
+    };
+  }
+
+  var WK = window.Worker;
+  if (WK) {
+    var WKW = function (u, o) { return new WK(px(u), o); };
+    WKW.prototype = WK.prototype;
+    window.Worker = WKW;
+  }
+
+  // SharedWorker script fetches go through the proxy; fetches made inside a
+  // worker realm are a documented boundary (shim only patches this realm).
+  var SWK = window.SharedWorker;
+  if (SWK) {
+    var SWKW = function (u, o) { return new SWK(px(u), o); };
+    SWKW.prototype = SWK.prototype;
+    window.SharedWorker = SWKW;
+  }
+
   var ow = window.open;
   window.open = function (u, n, f) {
     try { u = px(u); } catch (e) {}
@@ -721,10 +1016,18 @@ function clientShim(tag) {
     try {
       var l = String(name).toLowerCase();
       if (l === "srcset") value = pxSet(value);
-      else if (l === "src" || l === "href" || l === "action" || l === "poster" || l === "data") value = px(value);
+      else if (l === "src" || l === "href" || l === "action" || l === "formaction" || l === "poster" || l === "data") value = px(value);
     } catch (e) {}
     return sat.call(this, name, value);
   };
+
+  var ir = CSSStyleSheet.prototype.insertRule;
+  if (ir) {
+    CSSStyleSheet.prototype.insertRule = function (rule, idx) {
+      try { rule = rwCss(rule); } catch (e) {}
+      return ir.call(this, rule, idx);
+    };
+  }
 
   function patch(ctor, prop) {
     if (!ctor) return;
@@ -751,6 +1054,46 @@ function clientShim(tag) {
     patch(ctor, "action");
     patch(ctor, "poster");
   });
+
+  // Direct form.submit() calls skip the submit event; retarget first.
+  var fsubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function () {
+    try {
+      var a = this.getAttribute("action");
+      if (a) {
+        var n = px(a);
+        if (n !== a) sat.call(this, "action", n);
+      }
+    } catch (e) {}
+    return fsubmit.call(this);
+  };
+
+  // JS-driven absolute navigations must stay on the proxy. Location members
+  // are [LegacyUnforgeable] in most engines, so these patches may no-op; the
+  // known boundary (absolute location.href escapes the proxy) is documented
+  // in AUDIT.md, relative navigations resolve inside the proxy URL space.
+  try {
+    ["assign", "replace"].forEach(function (m) {
+      var orig = Location.prototype[m];
+      if (!orig) return;
+      Location.prototype[m] = function (u) {
+        try { u = px(String(u)); } catch (e) {}
+        return orig.call(this, u);
+      };
+    });
+    var lhd = Object.getOwnPropertyDescriptor(Location.prototype, "href");
+    if (lhd && lhd.set) {
+      Object.defineProperty(Location.prototype, "href", {
+        configurable: true,
+        enumerable: lhd.enumerable,
+        get: function () { return lhd.get.call(this); },
+        set: function (v) {
+          try { v = px(String(v)); } catch (e) {}
+          lhd.set.call(this, v);
+        },
+      });
+    }
+  } catch (e) {}
 
   if (navigator.serviceWorker) {
     try {
@@ -793,7 +1136,7 @@ function clientShim(tag) {
     var h = el.getAttribute("href");
     if (h && h.charAt(0) !== "#") {
       var n = px(h);
-      if (n !== h) el.setAttribute("href", n);
+      if (n !== h) sat.call(el, "href", n);
     }
   }, true);
   document.addEventListener("submit", function (e) {
@@ -802,7 +1145,7 @@ function clientShim(tag) {
     var a = f.getAttribute("action");
     if (a) {
       var n = px(a);
-      if (n !== a) f.setAttribute("action", n);
+      if (n !== a) sat.call(f, "action", n);
     }
   }, true);
 })();
