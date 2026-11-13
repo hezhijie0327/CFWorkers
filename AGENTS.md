@@ -13,6 +13,8 @@ its own directory with a `worker.js` and a per-worker `wrangler.jsonc`:
 
 This is a pure JavaScript project with no build system. Each worker is a standalone script.
 Biome (pinned in devDependencies) enforces the formatting rules below; run `pnpm install` first.
+`wrangler` is also a devDependency - use `pnpm wrangler …` (its version pins the safe
+compatibility_date ceiling and the local dev runtime).
 
 ### Lint & Format
 
@@ -40,9 +42,24 @@ periodically, review `git diff`, then commit. Plain Node script, same command in
 
 ### Testing
 
-Since there are no automated tests defined, manual testing involves:
-1. Deploying to a Cloudflare Workers account
-2. Testing endpoints directly or through a browser
+Audit-grade protocol testing runs against local `wrangler dev` instances - see
+[AUDIT.md](AUDIT.md) for the full playbook (matrices, gates, environment traps).
+Quick reference:
+
+```bash
+node scripts/audit-container-unit.mjs   # container-proxy unit audit (no server needed)
+node scripts/audit-upstream.mjs         # deterministic upstream harness on :8901
+pnpm wrangler dev --config workers/reverse-proxy/wrangler.jsonc --port 8788
+node scripts/audit-reverse-e2e.mjs      # reverse-proxy E2E vs the harness
+pnpm wrangler dev --config workers/container-proxy/wrangler.jsonc --port 8787
+node scripts/audit-container-e2e.mjs    # container-proxy E2E vs real registries
+```
+
+- Browser shim assertions: open
+  `http://127.0.0.1:8788/http://127.0.0.1:8901/shim-test` (16 in-page checks).
+- All audit scripts are plain Node.js with zero dependencies; exit 1 = failure.
+- Cache-behavior assertions require a fresh dev instance (hot reload poisons the
+  local Cache API - AUDIT.md §10); clear `workers/*/.wrangler` and restart first.
 
 ### Deployment
 
