@@ -58,9 +58,7 @@ node scripts/audit-container-e2e.mjs    # container-proxy E2E vs real registries
 Unreachable-upstream full chains (Docker Hub, github.com) run under
 `scripts/dev-via-proxy.mjs`, which routes the worker's outbound `fetch()` through
 Node so `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY` apply - workerd itself ignores
-proxy env entirely. The gh-mirror worker lives in the blog repo
-(`../blog/workers/gh-mirror/`); `scripts/audit-ghmirror-unit.mjs` audits it there
-by default (argv overrides the path), and the runner accepts any worker directory.
+proxy env entirely. The runner accepts any worker directory argument.
 
 - Browser shim assertions: open
   `http://127.0.0.1:8788/http://127.0.0.1:8901/shim-test` (16 in-page checks).

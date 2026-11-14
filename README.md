@@ -80,9 +80,6 @@ NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://10.192.7.1:7890 \
 node scripts/audit-dockerhub-e2e.mjs  # 真实 Docker Hub 全链（17 项；认证段用
                                       # DOCKER_ID/DOCKER_PAT env，凭据不落盘）
 
-node scripts/audit-ghmirror-unit.mjs  # gh-mirror 单元审计（25 项；worker 源在
-                                      # ../blog/workers/gh-mirror/，argv 可覆写）
-
 pnpm wrangler dev --config workers/container-proxy/wrangler.jsonc --port 8787
 node scripts/audit-container-e2e.mjs  # container-proxy 真实 registry E2E（19 项）
 ```

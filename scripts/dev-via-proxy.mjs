@@ -20,7 +20,7 @@
 // Upgrade passthrough here).
 //
 // Secrets: bindings come from the worker's wrangler.jsonc vars plus
-// GITHUB_TOKEN from the environment when set (gh-mirror authenticated tests).
+// worker-specific secrets from the environment when set (e.g. GITHUB_TOKEN).
 
 import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
