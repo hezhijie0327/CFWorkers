@@ -1,5 +1,10 @@
 # Cloudflare Workers
 
+[![Version](https://img.shields.io/badge/Version-1.0.0-informational)](https://github.com/hezhijie0327/CFWorkers/releases)
+[![License](https://img.shields.io/badge/License-Apache%202.0--Commons%20Clause-blue)](LICENSE)
+[![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black)](https://developer.mozilla.org/docs/Web/JavaScript)
+[![Biome](https://img.shields.io/badge/Biome-60A5FA?logo=biome&logoColor=white)](https://biomejs.dev/)
+
 这个仓库包含了多个实用的 Cloudflare Workers 脚本，用于提供各种网络代理和服务功能。
 
 ## 特性
