@@ -124,7 +124,7 @@ console.log("container-proxy E2E audit (wrangler dev :8787 vs real registries)")
         (challenge.headers["www-authenticate"] || "").includes('realm="http://quay.localhost'),
         challenge.headers["www-authenticate"],
     );
-    check("quay-manifest-200", manifest !== null && manifest.status === 200, `${manifest && manifest.status}`);
+    check("quay-manifest-200", manifest !== null && manifest.status === 200, `${manifest?.status}`);
     const digest = manifest?.headers["docker-content-digest"];
     check("quay-manifest-digest", typeof digest === "string" && digest.startsWith("sha256:"), `${digest}`);
     if (digest) {
@@ -140,8 +140,8 @@ console.log("container-proxy E2E audit (wrangler dev :8787 vs real registries)")
                 second.status === 200 &&
                 first.body.equals(second.body) &&
                 first.headers["cache-control"] === "public, max-age=604800" &&
-                second.headers["age"] !== undefined,
-            `first=${first.status} second=${second.status} cc=${second.headers["cache-control"]} age=${second.headers["age"]}`,
+                second.headers.age !== undefined,
+            `first=${first.status} second=${second.status} cc=${second.headers["cache-control"]} age=${second.headers.age}`,
         );
     }
     // HEAD blob through redirect keeps HEAD
@@ -163,13 +163,13 @@ console.log("container-proxy E2E audit (wrangler dev :8787 vs real registries)")
     const { challenge, token, manifest } = await checkReachable("ghcr-dance", () =>
         pullDance("ghcr", "stefanprodan/podinfo", "latest"),
     ).then((r) => r || { challenge: null, token: null, manifest: null });
-    check("ghcr-challenge-401", challenge !== null && challenge.status === 401, `${challenge && challenge.status}`);
+    check("ghcr-challenge-401", challenge !== null && challenge.status === 401, `${challenge?.status}`);
     check(
         "ghcr-realm-on-proxy",
         (challenge?.headers["www-authenticate"] || "").includes('realm="http://ghcr.localhost'),
         challenge?.headers["www-authenticate"],
     );
-    if (token && token.status) {
+    if (token?.status) {
         check("ghcr-token-via-worker", token.status === 200, `${token.status}`);
     }
     if (manifest) {

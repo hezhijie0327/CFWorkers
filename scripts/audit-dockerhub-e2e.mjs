@@ -16,7 +16,6 @@
 // Host-header routing via node:http (fetch() forbids overriding Host).
 import http from "node:http";
 
-const WORKER = "http://127.0.0.1:8786";
 const DOCKER_HOST = "docker.localhost";
 const MANIFEST_ACCEPT =
     "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, " +
