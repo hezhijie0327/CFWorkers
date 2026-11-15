@@ -20,12 +20,12 @@ NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://10.192.7.1:7890 \
 
 Audit scripts (`node scripts/audit-*.mjs`, all zero-dependency, exit 1 = failures present):
 
-| Script | Prerequisites | Coverage |
-| ------ | ------------- | -------- |
-| `audit-container-unit.mjs` | none (mock fetch + in-memory cache) | Docker Hub / elastic full-protocol paths (fallback for blocked networks): 202 Location, realm routing, token/manifest/blob caching, HEAD replay, cf-\*/AE header filtering |
-| `audit-container-e2e.mjs` | container wrangler dev :8787 | Real quay/ghcr/k8s/nvcr/mcr: challenge→token→manifest→blob full dance + digest caching |
-| `audit-dockerhub-e2e.mjs` | dev-via-proxy runner :8786 (proxy egress) | **Real Docker Hub full chain**: realm rewrite→anonymous token→tag/digest manifest→blob 307 follow→HEAD; auth segment (`DOCKER_ID`/`DOCKER_PAT` env, never written to disk) verifies Basic→JWT exchange + account rate-limit attribution |
-| `audit-reverse-e2e.mjs` | reverse wrangler dev :8788 + harness | §5 full matrix (header filtering/rewriting/GBK/compression/redirects/cookies/Range/304/cache gating/preflight/userinfo/referer fallback/SSE) |
+| Script                     | Prerequisites                             | Coverage                                                                                                                                                                                                                                |
+| -------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit-container-unit.mjs` | none (mock fetch + in-memory cache)       | Docker Hub / elastic full-protocol paths (fallback for blocked networks): 202 Location, realm routing, token/manifest/blob caching, HEAD replay, cf-\*/AE header filtering                                                              |
+| `audit-container-e2e.mjs`  | container wrangler dev :8787              | Real quay/ghcr/k8s/nvcr/mcr: challenge→token→manifest→blob full dance + digest caching                                                                                                                                                  |
+| `audit-dockerhub-e2e.mjs`  | dev-via-proxy runner :8786 (proxy egress) | **Real Docker Hub full chain**: realm rewrite→anonymous token→tag/digest manifest→blob 307 follow→HEAD; auth segment (`DOCKER_ID`/`DOCKER_PAT` env, never written to disk) verifies Basic→JWT exchange + account rate-limit attribution |
+| `audit-reverse-e2e.mjs`    | reverse wrangler dev :8788 + harness      | §5 full matrix (header filtering/rewriting/GBK/compression/redirects/cookies/Range/304/cache gating/preflight/userinfo/referer fallback/SSE)                                                                                            |
 
 - International network (GitHub, overseas registries, wrangler downloads): `HTTP_PROXY=http://10.192.7.1:7890 HTTPS_PROXY=http://10.192.7.1:7890 NO_PROXY=localhost,127.0.0.1`.
 - Local workerd routes subdomains by **Host header**: `curl -H "Host: quay.localhost" http://127.0.0.1:8787/v2/`. Node's fetch doesn't allow changing the Host header; Host routing uses `node:http` (audit-container-e2e does exactly this).
@@ -55,21 +55,21 @@ pnpm run bump-compat         # align compatibility_date with the latest wrangler
 
 Unit level (`audit-container-unit.mjs`, mock upstream covers the blocked Docker Hub/elastic full protocol) + real registries (`audit-container-e2e.mjs`, quay/ghcr/k8s/nvcr/mcr; explicit skip when k8s's 307 target is unreachable).
 
-| Face | Operation | Expected |
-| ---- | --------- | -------- |
-| Subdomain routing | `curl -H "Host: <sub>.localhost" :8787/v2/` | 401 + realm rewritten to worker origin (`http://<sub>.localhost/...`, local http as-is) |
-| Unknown subdomain | `Host: foo.localhost` | 400 JSON + CORS trio |
-| Preflight | `OPTIONS` + `Access-Control-Request-Method` | 204 + CORS, no upstream hit |
-| Off-host auth routing | docker `/token`, elastic `/auth` | Forwarded to auth.docker.io / docker-auth.elastic.co respectively (REGISTRY_AUTH table) |
-| Anonymous token | `/token?service=…&scope=…` ×2 | 200; second hits cache (upstream count doesn't rise); with Authorization not cached |
-| Token TTL | parse `expires_in` | `max-age=min(expires_in-60, 240)` |
-| Tag manifest | `/v2/<repo>/manifests/latest` | 200 but no-store (tags mutable, not cached) |
-| Digest manifest | `…/manifests/sha256:<64hex>` ×2 | 200 + `public, max-age=604800`; second time upstream count doesn't rise |
-| Blob 307 | `…/blobs/sha256:…` | Server-side follows CDN; CDN side **no Authorization**, UA preserved; cached by worker URL |
-| HEAD blob | same as above, HEAD | 307 replay keeps HEAD, response has no body |
-| **Push 202** | `POST /v2/<n>/blobs/uploads/` | Must **not** follow 202; Location rewritten back to worker origin for PATCH/PUT continuation (PATCH's 204 Location likewise rewritten) |
-| Header filtering | what the upstream receives | No `cf-*`/host/accept-encoding/hop-by-hop; Authorization/Accept preserved |
-| Real dance | quay/ghcr/nvcr/mcr: challenge→token(with scope)→manifest | All 200; mcr has no challenge, direct |
+| Face                  | Operation                                                | Expected                                                                                                                               |
+| --------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Subdomain routing     | `curl -H "Host: <sub>.localhost" :8787/v2/`              | 401 + realm rewritten to worker origin (`http://<sub>.localhost/...`, local http as-is)                                                |
+| Unknown subdomain     | `Host: foo.localhost`                                    | 400 JSON + CORS trio                                                                                                                   |
+| Preflight             | `OPTIONS` + `Access-Control-Request-Method`              | 204 + CORS, no upstream hit                                                                                                            |
+| Off-host auth routing | docker `/token`, elastic `/auth`                         | Forwarded to auth.docker.io / docker-auth.elastic.co respectively (REGISTRY_AUTH table)                                                |
+| Anonymous token       | `/token?service=…&scope=…` ×2                            | 200; second hits cache (upstream count doesn't rise); with Authorization not cached                                                    |
+| Token TTL             | parse `expires_in`                                       | `max-age=min(expires_in-60, 240)`                                                                                                      |
+| Tag manifest          | `/v2/<repo>/manifests/latest`                            | 200 but no-store (tags mutable, not cached)                                                                                            |
+| Digest manifest       | `…/manifests/sha256:<64hex>` ×2                          | 200 + `public, max-age=604800`; second time upstream count doesn't rise                                                                |
+| Blob 307              | `…/blobs/sha256:…`                                       | Server-side follows CDN; CDN side **no Authorization**, UA preserved; cached by worker URL                                             |
+| HEAD blob             | same as above, HEAD                                      | 307 replay keeps HEAD, response has no body                                                                                            |
+| **Push 202**          | `POST /v2/<n>/blobs/uploads/`                            | Must **not** follow 202; Location rewritten back to worker origin for PATCH/PUT continuation (PATCH's 204 Location likewise rewritten) |
+| Header filtering      | what the upstream receives                               | No `cf-*`/host/accept-encoding/hop-by-hop; Authorization/Accept preserved                                                              |
+| Real dance            | quay/ghcr/nvcr/mcr: challenge→token(with scope)→manifest | All 200; mcr has no challenge, direct                                                                                                  |
 
 - **Auth realm mapping is based on empirical measurement** (2026-11 probing): docker.io→auth.docker.io`/token`, elastic→docker-auth.elastic.co`/auth` (off-host, requires (1) realm alias rewrite (2) path routing — missing either breaks it); ecr/ghcr/k8s/nvcr/quay/mcr realms all live on the registry itself (gcr=`/v2/token`, quay=`/v2/auth`, ecr=`/token/` with **trailing slash**). When adding a registry, first probe with `curl -sI https://<registry>/v2/ | grep -i www-authenticate`, then register.
 - k8s manifest/blob 307s to `us-west2-docker.pkg.dev` (Google) — unreachable from the local network, E2E explicitly skips; deployed workers go through Cloudflare egress, unaffected.
@@ -79,26 +79,26 @@ Unit level (`audit-container-unit.mjs`, mock upstream covers the blocked Docker 
 
 E2E: `audit-reverse-e2e.mjs` + browser shim assertion page (harness `/shim-test`) + git + real sites.
 
-| Face | URL / operation | Expected |
-| ---- | --------------- | -------- |
-| Usage page | `GET /` | HTML 200 |
-| Header filtering | POST `/…/echo` | Upstream has no accept-encoding/cookie/hop-by-hop/cf-\* (host is a protocol-layer artifact); Referer/Origin restored from the worker domain; body as-is |
-| HTML rewriting | harness `/` | abs/rel links, srcset, style attributes (**any element**), `<style>` blocks, @import, script, form action all rewritten; preconnect/dns-prefetch removed; shim **injected at the very top of head** and only once |
-| CSS | `/css` ×2 | url()/@import rewritten; CT utf-8; CC passed through as `public, max-age`; second hits cache and **still rewritten content** |
-| GBK | `/gbk.html` | Transcoded to readable UTF-8 (meta sniff when no header charset) |
-| Compression | `/gzip` `/br` (client sends AE) | Upstream receives identity (AE stripped); body plaintext. Response-leg Content-Encoding is the runtime's transparent re-compression per client AE, not asserted |
-| Redirects | 301/302/303/307/308 × abs/rel | Status preserved + Location rewritten to worker prefix |
-| Cookies | set→echo | Response: `p<tag>name=value; attrs…; Path=/` (**semicolon-separated**, no Domain, __Host-/__Secure- prefixes stripped, SameSite=None gets Secure added); request: prefixes removed, other-site tags dropped |
-| Range | `Range: bytes=100-199` | 206 passthrough, bypasses cache |
-| 304 | `If-None-Match` | 304 passthrough |
-| Edge cache | static types ×2 + /hits counter | Only fully gated responses enter cache (type whitelist + upstream CC allows + no Set-Cookie/Vary restrictions + request has no range/conditional/auth/cookie); HTML always no-store |
-| Preflight | OPTIONS + ACRM | 204 + CORS, no upstream hit |
-| Userinfo | `/http://user:pass@…/auth401` | URL credentials converted to Basic header, URL sanitized |
-| Referer fallback | `GET /bytes` + proxied-page Referer | Resolves to target domain (absolute-path semantics), served through the proxy |
-| Git | `clone`/`push`/`re-clone` | Byte-level passthrough, pushed commits visible in a fresh clone |
-| WebSocket | shim page ws echo | Send/receive echo + close propagates both ways; subprotocol negotiation echoed (RFC 6455); upgrade carries translated cookies |
-| Shim (browser) | in-page assertions on harness `/shim-test` | fetch(rel/abs/Request), XHR, EventSource, sendBeacon, Worker, pushState/replaceState (including idempotence), cookie read/write, img.src, srcset, insertRule, direct form.submit() call, WS — all through the proxy |
-| Real sites | example.com, raw.githubusercontent.com | Pages render correctly (including multilingual charsets), raw fetch 200 |
+| Face             | URL / operation                            | Expected                                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Usage page       | `GET /`                                    | HTML 200                                                                                                                                                                                                            |
+| Header filtering | POST `/…/echo`                             | Upstream has no accept-encoding/cookie/hop-by-hop/cf-\* (host is a protocol-layer artifact); Referer/Origin restored from the worker domain; body as-is                                                             |
+| HTML rewriting   | harness `/`                                | abs/rel links, srcset, style attributes (**any element**), `<style>` blocks, @import, script, form action all rewritten; preconnect/dns-prefetch removed; shim **injected at the very top of head** and only once   |
+| CSS              | `/css` ×2                                  | url()/@import rewritten; CT utf-8; CC passed through as `public, max-age`; second hits cache and **still rewritten content**                                                                                        |
+| GBK              | `/gbk.html`                                | Transcoded to readable UTF-8 (meta sniff when no header charset)                                                                                                                                                    |
+| Compression      | `/gzip` `/br` (client sends AE)            | Upstream receives identity (AE stripped); body plaintext. Response-leg Content-Encoding is the runtime's transparent re-compression per client AE, not asserted                                                     |
+| Redirects        | 301/302/303/307/308 × abs/rel              | Status preserved + Location rewritten to worker prefix                                                                                                                                                              |
+| Cookies          | set→echo                                   | Response: `p<tag>name=value; attrs…; Path=/` (**semicolon-separated**, no Domain, __Host-/__Secure- prefixes stripped, SameSite=None gets Secure added); request: prefixes removed, other-site tags dropped         |
+| Range            | `Range: bytes=100-199`                     | 206 passthrough, bypasses cache                                                                                                                                                                                     |
+| 304              | `If-None-Match`                            | 304 passthrough                                                                                                                                                                                                     |
+| Edge cache       | static types ×2 + /hits counter            | Only fully gated responses enter cache (type whitelist + upstream CC allows + no Set-Cookie/Vary restrictions + request has no range/conditional/auth/cookie); HTML always no-store                                 |
+| Preflight        | OPTIONS + ACRM                             | 204 + CORS, no upstream hit                                                                                                                                                                                         |
+| Userinfo         | `/http://user:pass@…/auth401`              | URL credentials converted to Basic header, URL sanitized                                                                                                                                                            |
+| Referer fallback | `GET /bytes` + proxied-page Referer        | Resolves to target domain (absolute-path semantics), served through the proxy                                                                                                                                       |
+| Git              | `clone`/`push`/`re-clone`                  | Byte-level passthrough, pushed commits visible in a fresh clone                                                                                                                                                     |
+| WebSocket        | shim page ws echo                          | Send/receive echo + close propagates both ways; subprotocol negotiation echoed (RFC 6455); upgrade carries translated cookies                                                                                       |
+| Shim (browser)   | in-page assertions on harness `/shim-test` | fetch(rel/abs/Request), XHR, EventSource, sendBeacon, Worker, pushState/replaceState (including idempotence), cookie read/write, img.src, srcset, insertRule, direct form.submit() call, WS — all through the proxy |
+| Real sites       | example.com, raw.githubusercontent.com     | Pages render correctly (including multilingual charsets), raw fetch 200                                                                                                                                             |
 
 - The shim assertion page is provided by the harness; the final relative navigation `/nav-target` also verifies referer fallback (absolute `location.href` assignment is a registered boundary, see §8).
 
