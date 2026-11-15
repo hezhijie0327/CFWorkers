@@ -1,15 +1,13 @@
-# Cloudflare Workers 工具集
+# Cloudflare Workers
 
 这个仓库包含了多个实用的 Cloudflare Workers 脚本，用于提供各种网络代理和服务功能。
 
-## 项目概览
+## 特性
 
 | 目录                       | 功能                                                                                                                    |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `workers/container-proxy/` | 容器镜像仓库代理（Docker Hub、GHCR、quay.io、gcr.io 等 9 个源，支持 login/pull/**push**、token/manifest/blob 边缘缓存） |
 | `workers/reverse-proxy/`   | 通用反向代理（任意 URL 透传、网页/URL 改写、SPA 客户端垫片、git clone/push、WebSocket、静态资源边缘缓存）               |
-
-## 能力速览
 
 **container-proxy**（`docker.<worker-host>/v2/…`、`ghcr.<worker-host>/…` 等子域名路由）
 
@@ -32,7 +30,7 @@
 - git smart-HTTP 字节级透传（`git clone`/`push`）、WebSocket 中继（含子协议
   协商）、Range/条件请求透传、静态资源按上游缓存指令门控的边缘缓存
 
-## 部署方法
+## 快速开始
 
 ### 准备工作
 
@@ -96,6 +94,6 @@ node scripts/audit-container-e2e.mjs  # container-proxy 真实 registry E2E（19
 5. reverse-proxy 是无鉴权的开放代理（个人使用前提）；缓存永不落带
    Set-Cookie 或鉴权请求的响应，详见 AUDIT.md §9
 
-## 许可证
+## License
 
-本项目采用Apache License 2.0 with Commons Clause v1.0许可证 - 详见[LICENSE](LICENSE)文件
+[Apache License 2.0 with Commons Clause v1.0](LICENSE)
